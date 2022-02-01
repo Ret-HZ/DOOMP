@@ -22,10 +22,17 @@
 
 
 
-from binary_reader import BinaryReader, Endian
+from binary_reader import BinaryReader, Endian, Whence
 import argparse
+import json
 import sys
 import os
+
+
+
+__version__ = "1.1"
+
+METADATA_FILENAME = "_metadata.json"
 
 
 
@@ -36,6 +43,9 @@ class PackedFile:
         self.start_offset = 0
         self.size = 0
         self.data = bytearray()
+        #Metadata
+        self.index = 0
+        self.hash = 0
     
     def dat_to_file(self, reader, path):
         print(f"Unpacking {self.filename} ({self.size} bytes)")
@@ -58,6 +68,13 @@ class PackedFile:
         writer.write_bytes(bytes(file_bytearray))
         writer.align(0x10)
 
+    def dump_metadata(self, metadata):
+        meta = dict()
+        meta["index"] = self.index
+        meta["hash"] = self.hash
+        metadata["Files"][self.filename] = meta
+
+
 
 
 def unpackDAT(path, is_console=False):
@@ -73,9 +90,10 @@ def unpackDAT(path, is_console=False):
         ptr_file_extension_table = reader.read_uint32() #0xC
         ptr_filename_table = reader.read_uint32() #0x10
         ptr_file_size_table = reader.read_uint32() #0x14
-        ptr_unknown = reader.read_uint32() #0x18
+        ptr_metadata_table = reader.read_uint32() #0x18
 
         print(f"Found {file_number} files.")
+        metadata = dict()
 
         #List init
         packed_file_list = []
@@ -107,23 +125,61 @@ def unpackDAT(path, is_console=False):
             size = reader.read_uint32()
             packed_file_list[i].size = size
 
+        #Metadata
+        reader.seek(ptr_metadata_table)
+        metadata['unk1'] = reader.read_int32()
+        metadata["Indices_unknown"] = list()
+        metadata["Files"] = dict()
+        offset_meta_indices_1 = reader.read_int32() #Relative
+        offset_meta_hashes = reader.read_int32() #Relative
+        offset_meta_indices_2 = reader.read_int32() #Relative
+        #Metadata Index 1
+        reader.seek(ptr_metadata_table + offset_meta_indices_1)
+        for i in range(int((offset_meta_hashes - offset_meta_indices_1)/2)):
+            metadata["Indices_unknown"].append(reader.read_int16())
+        #Metadata Index 2
+        reader.seek(ptr_metadata_table + offset_meta_indices_2)
+        for i in range(file_number):
+            packed_file_list[i].index = reader.read_int16()
+        #Metadata Hash
+        reader.seek(ptr_metadata_table + offset_meta_hashes)
+        for i in range(file_number):
+            packed_file_list[i].hash = reader.read_uint32()
+
         #Unpack files
         out_path = path + ".unpack/"
         if not os.path.exists(out_path):
             os.makedirs(out_path)
         for i in range(file_number):
+            packed_file_list[i].dump_metadata(metadata)
             packed_file_list[i].dat_to_file(reader, out_path)
+
+        #Save metadata
+        with open(out_path + METADATA_FILENAME, "w") as metafile:
+            json.dump(metadata, metafile, indent=2)
     
     f.close()
 
 
 
 def repackDAT(path, is_console=False):
+    new_path = rchop(path, ".unpack")
+    if os.path.isfile(new_path):
+        choice = input("WARNING: Output file already exists. It will be overwritten.\nContinue? (y/n) ")
+        if not choice.lower() == "" and not choice.lower().startswith('y'):
+            print("DAT repacking cancelled.")
+            sys.exit(2)
+
+    metafile = open(path + "/" + METADATA_FILENAME, "r")
+    metadata = json.load(metafile)
+    metafile.close()
+
     dir_list = os.listdir(path)
-    filename_list = []
+    filename_list = list(metadata["Files"].keys())
     for name in dir_list:
-        if os.path.isfile(path + "/" + name):
+        if os.path.isfile(path + "/" + name) and name not in filename_list:
             filename_list.append(name)
+    filename_list.remove(METADATA_FILENAME)
     file_number = len(filename_list)
     print(f"Found {file_number} files.")
 
@@ -135,7 +191,7 @@ def repackDAT(path, is_console=False):
     writer.write_uint32(0) #Placeholder pointer to file extension table. 0xC
     writer.write_uint32(0) #Placeholder pointer to filename table. 0x10
     writer.write_uint32(0) #Placeholder pointer to file size table. 0x14
-    writer.write_uint32(0) #Placeholder pointer to unknown data table. 0x18
+    writer.write_uint32(0) #Placeholder pointer to metadata table. 0x18
     writer.write_uint32(0) #Padding
 
     #List init, set filenames, extensions and sizes
@@ -147,6 +203,9 @@ def repackDAT(path, is_console=False):
         if len(pf.filename) > max_namefile_size: max_namefile_size = len(pf.filename) + 1
         pf.set_extension_from_filename()
         pf.size = os.path.getsize(path + "/" + pf.filename)
+        if pf.filename in metadata["Files"]:
+            pf.index = metadata["Files"][pf.filename]["index"]
+            pf.hash = metadata["Files"][pf.filename]["hash"]
         packed_file_list.append(pf)
     
     #Placeholder pointers for the data offset table
@@ -181,6 +240,33 @@ def repackDAT(path, is_console=False):
     writer.write_int32(st_ptr)
     writer.seek(curr_pos)
 
+    #Metadata table
+    writer.align(0x4)
+    mt_ptr = writer.pos()
+    writer.write_int32(metadata["unk1"])
+    writer.write_int32(0x10) #Relative offset to indices 1
+    writer.write_int32(0) #Placeholder relative offset for hashes
+    writer.write_int32(0) #Placeholder relative offset for indices 2
+    #Indices 1
+    for i in range(len(metadata["Indices_unknown"])):
+        writer.write_int16(metadata["Indices_unknown"][i])
+    #Hashes
+    mt_hashes_ptr = writer.pos()
+    for i in range(file_number):
+        writer.write_uint32(packed_file_list[i].hash)
+    #Indices 2
+    mt_indices_ptr = writer.pos()
+    for i in range(file_number):
+        writer.write_int16(packed_file_list[i].index)
+    #Update relative offsets for hashes and indices 2
+    writer.seek(mt_ptr + 0x8)
+    writer.write_int32(mt_hashes_ptr - mt_ptr)
+    writer.write_int32(mt_indices_ptr - mt_ptr)
+    #Update main table pointer
+    writer.seek(0x18)
+    writer.write_uint32(mt_ptr)
+    writer.seek(0, whence=Whence.END)
+
     #Write file data
     for i in range(file_number):
         packed_file_list[i].file_to_dat(writer, path)
@@ -191,7 +277,6 @@ def repackDAT(path, is_console=False):
         writer.write_uint32(packed_file_list[i].start_offset)
 
     #Save DAT
-    new_path = rchop(path, ".unpack")
     with open(new_path, 'wb') as file:
         file.write(writer.buffer())
         file.close()
@@ -216,16 +301,19 @@ ______ _____  ________  _________
 |___/  \___/  \___/\_|  |_/\_|    " -Doktor
                        
     ''')
-    print("METAL GEAR RISING: REVENGEANCE DAT ARCHIVE (UN)PACKER \n")
+    print("METAL GEAR RISING: REVENGEANCE DAT ARCHIVE (UN)PACKER")
+    print(f"Version: {__version__} \n")
+
     parser = argparse.ArgumentParser()
     parser.add_argument("input", help="Input file (DAT) or directory", type=str)
     parser.add_argument("-c", "--console", help="Use if the file(s) originate from the console (PS3/Xbox 360) versions", required=False, action="store_true")
+    if len(sys.argv) < 2:
+        parser.print_help()
+        input("\nPress ENTER to exit...")
+        sys.exit(1)
     args = parser.parse_args()
 
     path = args.input
-    if path is None:
-        parser.print_help()
-        sys.exit(1)
 
     if os.path.isfile(path):
         unpackDAT(path, args.console)
